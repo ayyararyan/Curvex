@@ -35,6 +35,11 @@ def select_candidates(
     diagnostics: pd.DataFrame,
     config: BacktestConfig,
 ) -> pd.DataFrame:
+    # Direction mapping (audit-verified): z < 0 → SHORT_BFLY (buy underpriced body,
+    # sell wings); z >= 0 → LONG_BFLY (sell overpriced body, buy wings). Consistent
+    # with engine.py._build_actions: LONG_BFLY entry = BUY wing_low + SELL body × 2
+    # + BUY wing_high (standard industry convention). z = 0 never reaches this branch
+    # in practice — filtered upstream by `abs(z) < entry_z` before direction is assigned.
     diag_ok = diagnostics[diagnostics["converged"] & (diagnostics["rmse"].fillna(np.inf) <= config.calibration_rmse_limit)]
     ok_keys = set(zip(diag_ok["bar_close"], diag_ok["root_symbol"], diag_ok["expiry_code"]))
     rows: list[dict] = []
