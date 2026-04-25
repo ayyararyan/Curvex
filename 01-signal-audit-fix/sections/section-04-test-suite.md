@@ -320,3 +320,15 @@ All 8 tests must pass. If `test_zscore_rolling_within_session` fails, section-02
 - **Create:** `tests/test_signal.py`
 - **Modify (minor refactor for testability):** `src/essvi_bfly/signal/zscores.py` — move `persistence` to module scope (if currently nested)
 - **Do NOT create:** `tests/__init__.py`
+
+---
+
+## Implementation Notes (actual vs planned)
+
+**`select_candidates` returns `pd.DataFrame`:** Plan tests used `[c.direction for c in candidates]` which iterates column names on a DataFrame. Implemented as `candidates["direction"].tolist()` and boolean indexing `candidates[candidates["direction"] == "LONG_BFLY"]`.
+
+**Direction assertions strengthened:** Changed from `"LONG_BFLY" in list` to `(candidates["direction"] == "LONG_BFLY").all()` — stronger assertion that locks sign convention completely.
+
+**BS-consistent mid prices in `make_butterfly_chain`:** Plan's suggested static mid values (wing=150, body=80) produce `market_premium=140` vs `model_premium≈3`, giving negative edge and zero candidates. Used `price_option_forward(forward, strike, tau, rate, body_iv_market, option_side)` to compute mid prices, ensuring `edge = 2*(body_BS(iv_market) - body_BS(iv_essvi)) ≈ 228` for LONG_BFLY and ≈222 for SHORT_BFLY.
+
+**NaN warmup clarification:** With `window=10, min_periods=10`: bars at indices 0–8 (9 bars) are NaN; bar 9+ is finite. The `rolling` window at index 9 has exactly 10 values, satisfying `min_periods=10`. The spec comment "bars 0-9 are NaN" is incorrect — bar 9 is finite.
