@@ -1,0 +1,312 @@
+from __future__ import annotations
+
+from dataclasses import asdict
+
+import numpy as np
+import pandas as pd
+
+from essvi_bfly.config import BacktestConfig
+from essvi_bfly.execution.fills import fill_leg
+from essvi_bfly.execution.slippage import estimate_transaction_cost
+from essvi_bfly.instruments import load_manifest
+from essvi_bfly.portfolio.structures import ButterflyTrade
+from essvi_bfly.preprocess.option_chain import build_session_chain
+from essvi_bfly.signal.candidate_selection import select_candidates
+from essvi_bfly.signal.residuals import calibrate_surface
+from essvi_bfly.signal.zscores import add_residual_zscores
+
+
+class BacktestEngine:
+    def __init__(self, config: BacktestConfig):
+        self.config = config
+        self.manifest = load_manifest(config.manifest_path)
+        self.config.ensure_output_dirs()
+
+    def available_sessions(self) -> list[str]:
+        sessions = sorted(self.manifest["session_date"].unique().tolist())
+
+        def _norm(s: str) -> str:
+            return s.replace("_", "-")
+
+        if self.config.start_date:
+            start = _norm(self.config.start_date)
+            sessions = [s for s in sessions if _norm(s) >= start]
+        if self.config.end_date:
+            end = _norm(self.config.end_date)
+            sessions = [s for s in sessions if _norm(s) <= end]
+        return sessions
+
+    def run(self) -> dict[str, pd.DataFrame]:
+        session_chains: list[pd.DataFrame] = []
+        diagnostics_frames: list[pd.DataFrame] = []
+        for root_symbol in self.config.root_symbols:
+            for session_date in self.available_sessions():
+                artifacts = build_session_chain(self.manifest, session_date, root_symbol, self.config)
+                chain, diagnostics = calibrate_surface(artifacts.option_bars, self.config)
+                chain = add_residual_zscores(chain, self.config)
+                session_chains.append(chain)
+                diagnostics_frames.append(diagnostics)
+        all_chain = pd.concat(session_chains, ignore_index=True) if session_chains else pd.DataFrame()
+        all_diagnostics = pd.concat(diagnostics_frames, ignore_index=True) if diagnostics_frames else pd.DataFrame()
+        candidates = select_candidates(all_chain, all_diagnostics, self.config)
+        if candidates.empty:
+            candidates = pd.DataFrame(
+                columns=[
+                    "bar_close",
+                    "root_symbol",
+                    "expiry_code",
+                    "option_side",
+                    "body_contract",
+                    "wing_low_contract",
+                    "wing_high_contract",
+                    "direction",
+                    "zscore",
+                    "market_premium",
+                    "model_premium",
+                    "theoretical_edge",
+                    "estimated_cost",
+                    "lot_size",
+                    "contract_multiplier",
+                ]
+            )
+        trades, fills, nav = self._simulate(all_chain, candidates)
+        reports = {
+            "chain": all_chain,
+            "calibration_diagnostics": all_diagnostics,
+            "candidates": candidates,
+            "fills": fills,
+            "trades": trades,
+            "nav": nav,
+        }
+        return reports
+
+    def _simulate(self, chain: pd.DataFrame, candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        if candidates.empty:
+            return (
+                pd.DataFrame(columns=["trade_id", "root_symbol", "expiry_code", "direction", "entry_bar", "body_contract", "wing_low_contract", "wing_high_contract", "option_side", "entry_zscore", "entry_cost", "lot_size", "contract_multiplier", "status"]),
+                pd.DataFrame(columns=["trade_id", "bar_close", "contract_name", "action", "fill_price", "reason"]),
+                pd.DataFrame(columns=["trade_id", "entry_bar", "exit_bar", "entry_zscore", "exit_zscore", "theoretical_edge", "transaction_cost", "pnl"]),
+            )
+        chain_index = chain.set_index(["bar_close", "contract_name"])
+        trades: list[ButterflyTrade] = []
+        fills_rows: list[dict] = []
+        nav_rows: list[dict] = []
+        active_until: dict[tuple[str, str, str, str, str, str], pd.Timestamp] = {}
+        trade_id = 1
+        for candidate in candidates.sort_values("bar_close").itertuples(index=False):
+            structure_key = (
+                candidate.root_symbol,
+                candidate.expiry_code,
+                candidate.direction,
+                candidate.body_contract,
+                candidate.wing_low_contract,
+                candidate.wing_high_contract,
+            )
+            blocked_until = active_until.get(structure_key)
+            if blocked_until is not None and pd.Timestamp(candidate.bar_close) < blocked_until:
+                continue
+            entry_bar = self._next_bar_for_contract(chain, candidate.body_contract, candidate.bar_close)
+            if entry_bar is None:
+                continue
+            entry_quotes = self._get_leg_open_quotes(chain_index, entry_bar, candidate)
+            if entry_quotes is None:
+                continue
+            entry_actions = self._build_actions(candidate, entry_quotes, is_exit=False)
+            fill_results = [fill_leg(row, action) for action, _, row in entry_actions]
+            if not all(fill.filled for fill in fill_results):
+                continue
+            lot_size = float(getattr(candidate, "lot_size", 1.0) or 1.0)
+            contract_multiplier = float(getattr(candidate, "contract_multiplier", 1.0) or 1.0)
+            entry_cashflow = self._cashflow_from_fills(entry_actions, fill_results, lot_size, contract_multiplier)
+            entry_turnover = self._turnover_from_fills(fill_results, lot_size, contract_multiplier)
+            entry_cost = estimate_transaction_cost(
+                entry_turnover,
+                self.config.fee_rate,
+                self.config.tax_rate,
+                self.config.leg_brokerage_per_order,
+                1,
+            )
+            exit_bar, exit_z, exit_cashflow, exit_turnover, exit_fill_results = self._simulate_exit(
+                chain,
+                chain_index,
+                candidate,
+                entry_bar,
+                lot_size,
+                contract_multiplier,
+            )
+            if exit_bar is None or exit_fill_results is None:
+                continue
+            exit_cost = estimate_transaction_cost(
+                exit_turnover,
+                self.config.fee_rate,
+                self.config.tax_rate,
+                self.config.leg_brokerage_per_order,
+                1,
+            )
+            transaction_cost = entry_cost + exit_cost
+            trade = ButterflyTrade(
+                trade_id=trade_id,
+                root_symbol=candidate.root_symbol,
+                expiry_code=candidate.expiry_code,
+                direction=candidate.direction,
+                entry_bar=entry_bar,
+                body_contract=candidate.body_contract,
+                wing_low_contract=candidate.wing_low_contract,
+                wing_high_contract=candidate.wing_high_contract,
+                option_side=candidate.option_side,
+                entry_zscore=float(candidate.zscore),
+                entry_cost=float(entry_cost),
+                exit_bar=exit_bar,
+                exit_zscore=None if exit_z is None else float(exit_z),
+                lot_size=lot_size,
+                contract_multiplier=contract_multiplier,
+                status="CLOSED",
+            )
+            active_until[structure_key] = pd.Timestamp(exit_bar)
+            trades.append(trade)
+            for (action, contract_name, _), fill in zip(entry_actions, fill_results):
+                fills_rows.append(
+                    {
+                        "trade_id": trade_id,
+                        "bar_close": entry_bar,
+                        "contract_name": contract_name,
+                        "action": action,
+                        "fill_price": fill.price,
+                        "reason": f"entry_{fill.reason}",
+                    }
+                )
+            exit_actions = self._build_actions(candidate, self._get_leg_open_quotes(chain_index, exit_bar, candidate), is_exit=True)
+            for (action, contract_name, _), fill in zip(exit_actions, exit_fill_results):
+                fills_rows.append(
+                    {
+                        "trade_id": trade_id,
+                        "bar_close": exit_bar,
+                        "contract_name": contract_name,
+                        "action": action,
+                        "fill_price": fill.price,
+                        "reason": f"exit_{fill.reason}",
+                    }
+                )
+            pnl = entry_cashflow + exit_cashflow - transaction_cost
+            nav_rows.append(
+                {
+                    "trade_id": trade_id,
+                    "entry_bar": entry_bar,
+                    "exit_bar": exit_bar,
+                    "entry_zscore": candidate.zscore,
+                    "exit_zscore": exit_z,
+                    "theoretical_edge": candidate.theoretical_edge,
+                    "entry_cashflow": entry_cashflow,
+                    "exit_cashflow": exit_cashflow,
+                    "transaction_cost": transaction_cost,
+                    "pnl": pnl,
+                }
+            )
+            trade_id += 1
+        return pd.DataFrame([asdict(t) for t in trades]), pd.DataFrame(fills_rows), pd.DataFrame(nav_rows)
+
+    def _next_bar_for_contract(self, chain: pd.DataFrame, contract_name: str, after_bar: pd.Timestamp) -> pd.Timestamp | None:
+        contract_rows = chain[chain["contract_name"] == contract_name].sort_values("bar_close")
+        later = contract_rows.loc[contract_rows["bar_close"] > after_bar, "bar_close"]
+        if later.empty:
+            return None
+        return later.iloc[0]
+
+    def _get_leg_quotes(self, chain_index: pd.DataFrame, bar_close: pd.Timestamp, candidate):
+        keys = [
+            (bar_close, candidate.wing_low_contract),
+            (bar_close, candidate.body_contract),
+            (bar_close, candidate.wing_high_contract),
+        ]
+        if any(key not in chain_index.index for key in keys):
+            return None
+        return (
+            chain_index.loc[keys[0]],
+            chain_index.loc[keys[1]],
+            chain_index.loc[keys[2]],
+        )
+
+    def _get_leg_open_quotes(self, chain_index: pd.DataFrame, bar_close: pd.Timestamp, candidate):
+        leg_quotes = self._get_leg_quotes(chain_index, bar_close, candidate)
+        if leg_quotes is None:
+            return None
+        out = []
+        for row in leg_quotes:
+            open_row = row.copy()
+            for src, dst in [("open_bp1", "bp1"), ("open_sp1", "sp1"), ("open_bq1", "bq1"), ("open_sq1", "sq1")]:
+                if src in open_row.index and pd.notna(open_row[src]):
+                    open_row[dst] = open_row[src]
+            out.append(open_row)
+        return tuple(out)
+
+    def _build_actions(self, candidate, leg_quotes, is_exit: bool):
+        low, body, high = leg_quotes
+        if candidate.direction == "LONG_BFLY":
+            if not is_exit:
+                return [
+                    ("BUY", candidate.wing_low_contract, low),
+                    ("SELL", candidate.body_contract, body),
+                    ("SELL", candidate.body_contract, body),
+                    ("BUY", candidate.wing_high_contract, high),
+                ]
+            return [
+                ("SELL", candidate.wing_low_contract, low),
+                ("BUY", candidate.body_contract, body),
+                ("BUY", candidate.body_contract, body),
+                ("SELL", candidate.wing_high_contract, high),
+            ]
+        if not is_exit:
+            return [
+                ("SELL", candidate.wing_low_contract, low),
+                ("BUY", candidate.body_contract, body),
+                ("BUY", candidate.body_contract, body),
+                ("SELL", candidate.wing_high_contract, high),
+            ]
+        return [
+            ("BUY", candidate.wing_low_contract, low),
+            ("SELL", candidate.body_contract, body),
+            ("SELL", candidate.body_contract, body),
+            ("BUY", candidate.wing_high_contract, high),
+        ]
+
+    def _cashflow_from_fills(self, actions, fills, lot_size: float, contract_multiplier: float) -> float:
+        scale = lot_size * contract_multiplier
+        return sum(
+            (fill.price if action == "SELL" else -fill.price) * scale
+            for (action, _, _), fill in zip(actions, fills)
+        )
+
+    def _turnover_from_fills(self, fills, lot_size: float, contract_multiplier: float) -> float:
+        scale = lot_size * contract_multiplier
+        return sum(abs(fill.price) * scale for fill in fills)
+
+    def _simulate_exit(
+        self,
+        chain: pd.DataFrame,
+        chain_index: pd.DataFrame,
+        candidate,
+        entry_bar: pd.Timestamp,
+        lot_size: float,
+        contract_multiplier: float,
+    ) -> tuple[pd.Timestamp | None, float | None, float | None, float | None, list | None]:
+        contract_rows = chain[chain["contract_name"] == candidate.body_contract].sort_values("bar_close")
+        later = contract_rows[contract_rows["bar_close"] > entry_bar].head(self.config.max_holding_bars)
+        if later.empty:
+            return None, None, None, None, None
+        candidate_exit_rows = []
+        for idx, row in enumerate(later.itertuples(index=False)):
+            should_exit = abs(getattr(row, "zscore", np.nan)) <= self.config.exit_z or abs(getattr(row, "zscore", np.nan)) >= self.config.stop_z
+            is_last = idx == len(later) - 1
+            if should_exit or is_last:
+                candidate_exit_rows.append((row.bar_close, row.zscore))
+        for exit_bar, exit_z in candidate_exit_rows:
+            leg_quotes = self._get_leg_open_quotes(chain_index, exit_bar, candidate)
+            if leg_quotes is None:
+                continue
+            exit_actions = self._build_actions(candidate, leg_quotes, is_exit=True)
+            fills = [fill_leg(row, action) for action, _, row in exit_actions]
+            if all(fill.filled for fill in fills):
+                exit_cashflow = self._cashflow_from_fills(exit_actions, fills, lot_size, contract_multiplier)
+                exit_turnover = self._turnover_from_fills(fills, lot_size, contract_multiplier)
+                return exit_bar, exit_z, exit_cashflow, exit_turnover, fills
+        return None, None, None, None, None
