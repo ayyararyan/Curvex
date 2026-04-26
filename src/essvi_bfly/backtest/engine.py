@@ -109,6 +109,7 @@ class BacktestEngine:
                 pd.DataFrame(columns=["trade_id", "entry_bar", "exit_bar", "entry_zscore", "exit_zscore", "theoretical_edge", "transaction_cost", "pnl"]),
             )
         chain_index = chain.set_index(["bar_close", "contract_name"])
+        bar_index = self._build_contract_bar_index(chain)
         trades: list[ButterflyTrade] = []
         fills_rows: list[dict] = []
         nav_rows: list[dict] = []
@@ -126,7 +127,7 @@ class BacktestEngine:
             blocked_until = active_until.get(structure_key)
             if blocked_until is not None and pd.Timestamp(candidate.bar_close) < blocked_until:
                 continue
-            entry_bar = self._next_bar_for_contract(chain, candidate.body_contract, candidate.bar_close)
+            entry_bar = self._next_bar_for_contract(chain, candidate.body_contract, candidate.bar_close, bar_index=bar_index)
             if entry_bar is None:
                 continue
             entry_quotes = self._get_leg_open_quotes(chain_index, entry_bar, candidate)
@@ -254,7 +255,43 @@ class BacktestEngine:
         df["cumulative_pnl"] = df["pnl"].cumsum()
         return df
 
-    def _next_bar_for_contract(self, chain: pd.DataFrame, contract_name: str, after_bar: pd.Timestamp) -> pd.Timestamp | None:
+    def _build_contract_bar_index(self, chain: pd.DataFrame) -> dict[str, pd.DatetimeIndex]:
+        """Pre-compute sorted bar_close DatetimeIndex per contract_name.
+
+        Returns dict mapping contract_name → sorted pd.DatetimeIndex of bar_close timestamps.
+        Preserves timezone (e.g. Asia/Kolkata) so searchsorted comparisons stay tz-aware.
+        Used by _next_bar_for_contract for O(log N) lookup via DatetimeIndex.searchsorted.
+        Called once before the candidate loop in _simulate.
+
+        Note: index is static — do not use with a streaming/appended chain.
+        """
+        index: dict[str, pd.DatetimeIndex] = {}
+        for contract_name, group in chain.groupby("contract_name", sort=False):
+            unique_bars = group["bar_close"].dropna().drop_duplicates().sort_values()
+            index[contract_name] = pd.DatetimeIndex(unique_bars)
+        return index
+
+    def _next_bar_for_contract(
+        self,
+        chain: pd.DataFrame,
+        contract_name: str,
+        after_bar: pd.Timestamp,
+        bar_index: dict[str, pd.DatetimeIndex] | None = None,
+    ) -> pd.Timestamp | None:
+        """Return the first bar_close strictly after after_bar for contract_name.
+
+        If bar_index provided: O(log N) via DatetimeIndex.searchsorted (tz-aware).
+        If bar_index is None: legacy O(N) DataFrame filter (backward compat).
+        Returns None if contract absent or no bar exists after after_bar.
+        """
+        if bar_index is not None:
+            arr = bar_index.get(contract_name)
+            if arr is None or len(arr) == 0:
+                return None
+            i = arr.searchsorted(after_bar, side="right")
+            if i >= len(arr):
+                return None
+            return arr[i]
         contract_rows = chain[chain["contract_name"] == contract_name].sort_values("bar_close")
         later = contract_rows.loc[contract_rows["bar_close"] > after_bar, "bar_close"]
         if later.empty:

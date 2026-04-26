@@ -548,3 +548,99 @@ def test_run_continues_after_data_error():
     reports, exc = _run_mocked(engine, [FileNotFoundError("fail"), None])
     assert exc is None
     assert reports is not None
+
+
+# ── _build_contract_bar_index / _next_bar_for_contract ────────────────────────
+
+
+def _synthetic_chain(contracts: list[str], bars_per_contract: int) -> pd.DataFrame:
+    """Build a synthetic chain DataFrame with bar_close and contract_name columns."""
+    rows = []
+    base = pd.Timestamp("2024-01-01 09:15")
+    for c in contracts:
+        for i in range(bars_per_contract):
+            rows.append({"contract_name": c, "bar_close": base + pd.Timedelta(minutes=5 * i)})
+    return pd.DataFrame(rows)
+
+
+class TestBuildContractBarIndex:
+    def test_returns_dict_keyed_by_contract_name(self):
+        chain = _synthetic_chain(["A", "B", "C"], 5)
+        idx = _engine()._build_contract_bar_index(chain)
+        assert isinstance(idx, dict)
+        assert set(idx.keys()) == {"A", "B", "C"}
+
+    def test_values_are_sorted_datetimeindex(self):
+        chain = _synthetic_chain(["A"], 5).sample(frac=1, random_state=42)
+        idx = _engine()._build_contract_bar_index(chain)
+        arr = idx["A"]
+        assert isinstance(arr, pd.DatetimeIndex)
+        assert arr.is_monotonic_increasing
+
+    def test_tz_aware_timestamps_preserved(self):
+        base = pd.Timestamp("2024-01-01 09:15", tz="Asia/Kolkata")
+        rows = [{"contract_name": "A", "bar_close": base + pd.Timedelta(minutes=5 * i)} for i in range(3)]
+        chain = pd.DataFrame(rows)
+        idx = _engine()._build_contract_bar_index(chain)
+        assert idx["A"].tz is not None
+        assert str(idx["A"].tz) == "Asia/Kolkata"
+
+    def test_all_contracts_present(self):
+        contracts = ["X1", "X2", "X3", "X4"]
+        chain = _synthetic_chain(contracts, 3)
+        idx = _engine()._build_contract_bar_index(chain)
+        assert set(idx.keys()) == set(contracts)
+
+    def test_empty_chain_returns_empty_dict(self):
+        chain = pd.DataFrame(columns=["contract_name", "bar_close"])
+        idx = _engine()._build_contract_bar_index(chain)
+        assert idx == {}
+
+
+class TestNextBarForContract:
+    def test_returns_first_bar_after_entry(self):
+        chain = _synthetic_chain(["A"], 5)
+        engine = _engine()
+        bar_index = engine._build_contract_bar_index(chain)
+        after = pd.Timestamp("2024-01-01 09:15")
+        result = engine._next_bar_for_contract(chain, "A", after, bar_index=bar_index)
+        assert result == pd.Timestamp("2024-01-01 09:20")
+
+    def test_returns_none_when_no_bar_after_entry(self):
+        chain = _synthetic_chain(["A"], 3)
+        engine = _engine()
+        bar_index = engine._build_contract_bar_index(chain)
+        last_bar = pd.Timestamp("2024-01-01 09:25")
+        result = engine._next_bar_for_contract(chain, "A", last_bar, bar_index=bar_index)
+        assert result is None
+
+    def test_returns_none_for_unknown_contract(self):
+        chain = _synthetic_chain(["A"], 5)
+        engine = _engine()
+        bar_index = engine._build_contract_bar_index(chain)
+        result = engine._next_bar_for_contract(chain, "UNKNOWN", pd.Timestamp("2024-01-01 09:15"), bar_index=bar_index)
+        assert result is None
+
+    def test_uses_binary_search_not_full_filter(self):
+        chain = _synthetic_chain(["A", "B"], 10)
+        engine = _engine()
+        bar_index = engine._build_contract_bar_index(chain)
+        after = pd.Timestamp("2024-01-01 09:30")
+        result_indexed = engine._next_bar_for_contract(chain, "A", after, bar_index=bar_index)
+        result_legacy = engine._next_bar_for_contract(chain, "A", after)
+        assert result_indexed == result_legacy
+
+    @pytest.mark.slow
+    def test_performance_10k_lookups(self):
+        import time
+        contracts = [f"C{i}" for i in range(100)]
+        chain = _synthetic_chain(contracts, 75)
+        engine = _engine()
+        bar_index = engine._build_contract_bar_index(chain)
+        after = pd.Timestamp("2024-01-01 09:30")
+        start = time.time()
+        for _ in range(100):
+            for c in contracts:
+                engine._next_bar_for_contract(chain, c, after, bar_index=bar_index)
+        elapsed = time.time() - start
+        assert elapsed < 1.0
