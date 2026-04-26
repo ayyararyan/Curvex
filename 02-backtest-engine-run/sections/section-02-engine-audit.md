@@ -51,28 +51,13 @@ PnL formula: `pnl = entry_cashflow + exit_cashflow − total_transaction_cost`
 
 ---
 
-## Transaction Cost Bug Fix
+## Transaction Cost — `orders=1` is Correct (No Change Needed)
 
-**Bug:** Both `estimate_transaction_cost` call sites in `_simulate` pass `orders=1`. A butterfly has 4 leg orders per event — this charges ₹20 brokerage instead of ₹80 per side (₹40 round-trip instead of ₹160).
+Both `estimate_transaction_cost` call sites in `_simulate` pass `orders=1`. This is **correct**: on NSE, all 4 butterfly legs are placed as a single combined basket/strategy order, not 4 separate orders. Brokerage is ₹20 per combined order → ₹20 at entry + ₹20 at exit = ₹40 round-trip total.
 
-**Fix:** Change both call sites from `orders=1` to `orders=4`.
+Do not change `orders=1`. The Opus review incorrectly flagged this by applying single-leg brokerage logic to a combined multi-leg NSE order.
 
-Entry call site:
-```python
-entry_cost = estimate_transaction_cost(
-    entry_turnover,
-    self.config.fee_rate,
-    self.config.tax_rate,
-    self.config.leg_brokerage_per_order,
-    4,   # was 1 — butterfly has 4 leg orders per entry
-)
-```
-
-Exit call site — same change.
-
-Alternatively use `orders=len(entry_fill_results)` for self-documentation.
-
-**Note:** `_turnover_from_fills` already correctly sums absolute fill prices across all 4 fills (body counted twice). Only the `orders` argument is wrong.
+`_turnover_from_fills` correctly sums absolute fill prices across all 4 fills (body counted twice) for STT/exchange fee computation — also correct and unchanged.
 
 ---
 
@@ -132,10 +117,6 @@ Import `FillResult` from `essvi_bfly.execution.fills`. Create synthetic fill obj
 
 # test_pnl_positive_for_profitable_reversal
 # entry_cashflow=60, exit_cashflow=-40, transaction_cost=10 → pnl=10 > 0
-
-# test_transaction_cost_uses_4_orders
-# Patch estimate_transaction_cost; run minimal _simulate
-# Assert mock called with orders=4
 ```
 
 ---
@@ -143,10 +124,9 @@ Import `FillResult` from `essvi_bfly.execution.fills`. Create synthetic fill obj
 ## Acceptance Checklist
 
 - [ ] `_build_actions` audit complete — "confirmed-correct" or list of cells fixed — recorded in commit message
-- [ ] Both `estimate_transaction_cost` calls in `_simulate` use `orders=4`
+- [ ] `orders=1` confirmed correct at both `estimate_transaction_cost` call sites (no change needed)
 - [ ] All 4 `test_build_actions_*` tests pass
 - [ ] `test_cashflow_long_bfly_entry_hand_computed` asserts exactly +60.0
-- [ ] `test_transaction_cost_uses_4_orders` verifies mock called with `orders=4`
 - [ ] `uv run pytest tests/ -v` exits 0
 
 ---

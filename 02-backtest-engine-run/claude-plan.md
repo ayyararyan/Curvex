@@ -93,11 +93,11 @@ For a profitable LONG_BFLY trade, the z-score reverts: the body cheapens and win
 
 **Sanity check (post-run):** For any profitable LONG_BFLY trade, `entry_cashflow + exit_cashflow > 0`. For a stopped-out trade, `entry_cashflow + exit_cashflow < total_transaction_cost`. This check belongs in the spot-check step.
 
-### Transaction Cost Bug Fix
+### Transaction Cost — `orders=1` is Correct
 
-**Bug:** `estimate_transaction_cost` is currently called with `orders=1` at both entry and exit. A butterfly has 4 leg orders per event — the brokerage term `brokerage × orders` therefore charges ₹20 instead of ₹80 per side.
+`estimate_transaction_cost` is called with `orders=1` at both entry and exit. This is **correct** for NSE multi-leg strategy execution: all 4 butterfly legs are placed as a single combined order (via basket/strategy order), not 4 separate orders. Brokerage is ₹20 per combined butterfly order → ₹20 at entry + ₹20 at exit = ₹40 round-trip. Do not change `orders=1`.
 
-**Fix:** Change both call sites in `_simulate` to pass `orders=4` (or `orders=len(entry_fill_results)`). The effect: round-trip brokerage per trade goes from ₹40 to ₹160. This meaningfully affects breakeven edge calculations.
+The Opus review incorrectly flagged this as a bug — it applied US single-leg logic to NSE combined-order execution.
 
 **Turnover note:** `_turnover_from_fills` correctly sums absolute fill prices across all 4 fills (body counted twice). For NSE STT/exchange fees computed on gross transaction value, this is the right denominator.
 
