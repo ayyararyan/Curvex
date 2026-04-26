@@ -128,8 +128,29 @@ Expected output on a clean pipeline: 11 lines all starting with `PASS:`. Any `FA
 
 ## Acceptance Checklist
 
-- [ ] `scripts/smoke_test_pipeline.py` exists and is executable via `uv run python scripts/smoke_test_pipeline.py`
-- [ ] `check()` unit tests pass
-- [ ] Script exits with code 1 when at least one check fails (test passes)
-- [ ] Script exits with code 0 when all 11 checks pass against a valid session
+- [x] `scripts/smoke_test_pipeline.py` exists and is executable via `uv run python scripts/smoke_test_pipeline.py`
+- [x] `check()` unit tests pass
+- [x] Script exits with code 1 when at least one check fails (test passes)
+- [x] Script exits with code 0 when all 11 checks pass against a valid session
 - [ ] Running against `2026_01_02 / NIFTY` exits 0 (pre-condition for section-07)
+
+## Implementation Notes (actual vs planned)
+
+**Deviations / fixes from code review:**
+
+1. **Check 3 (ATM mid)**: Fails unconditionally when no ATM rows found (len == 0 treated as FAIL, not empty-pass). Uses combined boolean mask on full chain for index-safety.
+
+2. **Check 4 (Forward quality)**: Removed `groupby('bar_close').first()` collapse. Operates on all rows directly — validates every expiry's forward against spot, not just the first-sorted expiry per bar.
+
+3. **Check 11 label**: Changed to "Z-score NaN in first {window} bars per contract" (was "rows").
+
+**Tests added** (7 total):
+- `test_check_helper_prints_pass_when_true`
+- `test_check_helper_prints_fail_when_false`
+- `test_check_helper_returns_true_on_pass`
+- `test_check_helper_returns_false_on_fail`
+- `test_main_exits_1_when_any_check_fails` (empty chain → check 1 fails)
+- `test_main_exits_0_when_all_checks_pass` (valid mock with all 11 passing)
+- `test_main_rmse_limit_override_drops_convergence_check` (rmse_limit=0.005 filters out high-rmse slices)
+
+**Module imports**: Moved `importlib.util`, `sys as _sys`, `Path as _Path` to top of `tests/test_engine.py`.

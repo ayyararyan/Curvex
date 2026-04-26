@@ -1,6 +1,9 @@
+import importlib.util
 import logging
+import sys as _sys
 import types
 import unittest.mock
+from pathlib import Path as _Path
 
 import numpy as np
 import pandas as pd
@@ -644,3 +647,135 @@ class TestNextBarForContract:
                 engine._next_bar_for_contract(chain, c, after, bar_index=bar_index)
         elapsed = time.time() - start
         assert elapsed < 1.0
+
+
+# ── smoke_test_pipeline ────────────────────────────────────────────────────
+
+
+def _smoke():
+    """Load scripts/smoke_test_pipeline.py as a module."""
+    p = _Path(__file__).parent.parent / "scripts" / "smoke_test_pipeline.py"
+    spec = importlib.util.spec_from_file_location("smoke_test_pipeline", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _make_smoke_valid_chain() -> pd.DataFrame:
+    base = pd.Timestamp("2026-01-02 09:15", tz="Asia/Kolkata")
+    bars = [base + pd.Timedelta(minutes=5 * i) for i in range(80)]
+    strikes = [97.0, 98.0, 99.0, 100.0, 101.0, 102.0]
+    rows = []
+    for strike in strikes:
+        contract = f"OPT_{int(strike)}"
+        for j, bar in enumerate(bars):
+            rows.append({
+                "contract_name": contract,
+                "bar_close": bar,
+                "strike": strike,
+                "tau_years": 0.1,
+                "forward": 100.0,
+                "underlying_price": 100.0,
+                "mid": 5.0,
+                "quote_ok": True,
+                "expiry_code": "JAN2026",
+                "zscore": float("nan") if j < 75 else 0.5,
+            })
+    return pd.DataFrame(rows)
+
+
+def _make_smoke_valid_diagnostics() -> pd.DataFrame:
+    base = pd.Timestamp("2026-01-02 09:15", tz="Asia/Kolkata")
+    return pd.DataFrame([
+        {
+            "bar_close": base + pd.Timedelta(minutes=5 * i),
+            "root_symbol": "NIFTY",
+            "expiry_code": "JAN2026",
+            "converged": True,
+            "rmse": 0.01,
+        }
+        for i in range(3)
+    ])
+
+
+def _make_smoke_valid_manifest() -> pd.DataFrame:
+    return pd.DataFrame([{
+        "session_date": "2026_01_02",
+        "contract_name": "NIFTY50",
+        "root_symbol": "NIFTY",
+        "resolved_path": "/fake/path",
+    }])
+
+
+def test_check_helper_prints_pass_when_true(capsys):
+    smoke = _smoke()
+    smoke.check("label", True, "detail")
+    assert "PASS" in capsys.readouterr().out
+
+
+def test_check_helper_prints_fail_when_false(capsys):
+    smoke = _smoke()
+    smoke.check("label", False, "detail")
+    assert "FAIL" in capsys.readouterr().out
+
+
+def test_check_helper_returns_true_on_pass():
+    assert _smoke().check("x", True) is True
+
+
+def test_check_helper_returns_false_on_fail():
+    assert _smoke().check("x", False) is False
+
+
+def test_main_exits_1_when_any_check_fails(monkeypatch):
+    smoke = _smoke()
+    monkeypatch.setattr(_sys, "argv", ["smoke", "--session", "2026_01_02", "--symbol", "NIFTY"])
+    empty_chain = pd.DataFrame(columns=[
+        "contract_name", "bar_close", "tau_years", "forward",
+        "underlying_price", "mid", "quote_ok", "expiry_code", "strike", "zscore",
+    ])
+    empty_diag = pd.DataFrame(columns=["bar_close", "root_symbol", "expiry_code", "converged", "rmse"])
+    artifact = unittest.mock.MagicMock()
+    artifact.option_bars = empty_chain
+    with unittest.mock.patch.object(smoke, "build_session_chain", return_value=artifact), \
+         unittest.mock.patch.object(smoke, "calibrate_surface", return_value=(empty_chain, empty_diag)), \
+         unittest.mock.patch.object(smoke, "add_residual_zscores", return_value=empty_chain), \
+         unittest.mock.patch.object(smoke, "load_manifest", return_value=_make_smoke_valid_manifest()):
+        with pytest.raises(SystemExit) as exc_info:
+            smoke.main()
+    assert exc_info.value.code == 1
+
+
+def test_main_exits_0_when_all_checks_pass(monkeypatch):
+    smoke = _smoke()
+    monkeypatch.setattr(_sys, "argv", ["smoke", "--session", "2026_01_02", "--symbol", "NIFTY"])
+    valid_chain = _make_smoke_valid_chain()
+    valid_diag = _make_smoke_valid_diagnostics()
+    artifact = unittest.mock.MagicMock()
+    artifact.option_bars = valid_chain
+    with unittest.mock.patch.object(smoke, "build_session_chain", return_value=artifact), \
+         unittest.mock.patch.object(smoke, "calibrate_surface", return_value=(valid_chain, valid_diag)), \
+         unittest.mock.patch.object(smoke, "add_residual_zscores", return_value=valid_chain), \
+         unittest.mock.patch.object(smoke, "load_manifest", return_value=_make_smoke_valid_manifest()):
+        with pytest.raises(SystemExit) as exc_info:
+            smoke.main()
+    assert exc_info.value.code == 0
+
+
+def test_main_rmse_limit_override_drops_convergence_check(monkeypatch):
+    """--rmse-limit-override filters out high-rmse slices, dropping converged count below 3 → exit 1."""
+    smoke = _smoke()
+    monkeypatch.setattr(_sys, "argv", ["smoke", "--session", "2026_01_02", "--symbol", "NIFTY",
+                                       "--rmse-limit-override", "0.005"])
+    valid_chain = _make_smoke_valid_chain()
+    # All 3 slices have rmse=0.01 > 0.005 limit → filtered out → converged=0/0 < 3 → FAIL
+    diag_high_rmse = _make_smoke_valid_diagnostics().assign(rmse=0.01)
+    artifact = unittest.mock.MagicMock()
+    artifact.option_bars = valid_chain
+    with unittest.mock.patch.object(smoke, "build_session_chain", return_value=artifact), \
+         unittest.mock.patch.object(smoke, "calibrate_surface", return_value=(valid_chain, diag_high_rmse)), \
+         unittest.mock.patch.object(smoke, "add_residual_zscores", return_value=valid_chain), \
+         unittest.mock.patch.object(smoke, "load_manifest", return_value=_make_smoke_valid_manifest()):
+        with pytest.raises(SystemExit) as exc_info:
+            smoke.main()
+    assert exc_info.value.code == 1
