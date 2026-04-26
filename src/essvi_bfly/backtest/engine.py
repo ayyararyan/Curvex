@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from essvi_bfly.config import BacktestConfig
-from essvi_bfly.execution.fills import fill_leg
+from essvi_bfly.execution.fills import FillResult, fill_leg
 from essvi_bfly.execution.slippage import estimate_transaction_cost
 from essvi_bfly.instruments import load_manifest
 from essvi_bfly.portfolio.structures import ButterflyTrade
@@ -129,7 +129,7 @@ class BacktestEngine:
                 self.config.leg_brokerage_per_order,
                 1,
             )
-            exit_bar, exit_z, exit_cashflow, exit_turnover, exit_fill_results = self._simulate_exit(
+            exit_result = self._simulate_exit(
                 chain,
                 chain_index,
                 candidate,
@@ -137,8 +137,9 @@ class BacktestEngine:
                 lot_size,
                 contract_multiplier,
             )
-            if exit_bar is None or exit_fill_results is None:
+            if exit_result is None:
                 continue
+            exit_bar, exit_z, exit_cashflow, exit_turnover, exit_fill_results, exit_type, fill_quality = exit_result
             exit_cost = estimate_transaction_cost(
                 exit_turnover,
                 self.config.fee_rate,
@@ -164,6 +165,8 @@ class BacktestEngine:
                 lot_size=lot_size,
                 contract_multiplier=contract_multiplier,
                 status="CLOSED",
+                exit_type=exit_type,
+                exit_fill_quality=fill_quality,
             )
             active_until[structure_key] = pd.Timestamp(exit_bar)
             trades.append(trade)
@@ -178,8 +181,21 @@ class BacktestEngine:
                         "reason": f"entry_{fill.reason}",
                     }
                 )
-            exit_actions = self._build_actions(candidate, self._get_leg_open_quotes(chain_index, exit_bar, candidate), is_exit=True)
-            for (action, contract_name, _), fill in zip(exit_actions, exit_fill_results):
+            if candidate.direction == "LONG_BFLY":
+                exit_leg_specs = [
+                    ("SELL", candidate.wing_low_contract),
+                    ("BUY", candidate.body_contract),
+                    ("BUY", candidate.body_contract),
+                    ("SELL", candidate.wing_high_contract),
+                ]
+            else:
+                exit_leg_specs = [
+                    ("BUY", candidate.wing_low_contract),
+                    ("SELL", candidate.body_contract),
+                    ("SELL", candidate.body_contract),
+                    ("BUY", candidate.wing_high_contract),
+                ]
+            for (action, contract_name), fill in zip(exit_leg_specs, exit_fill_results):
                 fills_rows.append(
                     {
                         "trade_id": trade_id,
@@ -275,13 +291,35 @@ class BacktestEngine:
     def _cashflow_from_fills(self, actions, fills, lot_size: float, contract_multiplier: float) -> float:
         scale = lot_size * contract_multiplier
         return sum(
-            (fill.price if action == "SELL" else -fill.price) * scale
+            (
+                (fill.price if fill.price is not None else 0.0)
+                if action == "SELL"
+                else -(fill.price if fill.price is not None else 0.0)
+            ) * scale
             for (action, _, _), fill in zip(actions, fills)
         )
 
     def _turnover_from_fills(self, fills, lot_size: float, contract_multiplier: float) -> float:
         scale = lot_size * contract_multiplier
-        return sum(abs(fill.price) * scale for fill in fills)
+        return sum(abs(fill.price if fill.price is not None else 0.0) * scale for fill in fills)
+
+    def _fill_leg_with_fallback(self, quote_row: pd.Series, action: str) -> FillResult:
+        half_spread = self.config.max_spread_pct / 4
+        if action == "BUY":
+            sp1 = quote_row.get("sp1")
+            if pd.notna(sp1) and sp1 > 0:
+                return FillResult(float(sp1), True, "ask_fill")
+            lp = quote_row.get("lp")
+            if pd.notna(lp) and lp > 0:
+                return FillResult(float(lp) * (1 + half_spread), True, "lp_fallback")
+            return FillResult(None, False, "no_quote")
+        bp1 = quote_row.get("bp1")
+        if pd.notna(bp1) and bp1 > 0:
+            return FillResult(float(bp1), True, "bid_fill")
+        lp = quote_row.get("lp")
+        if pd.notna(lp) and lp > 0:
+            return FillResult(float(lp) * (1 - half_spread), True, "lp_fallback")
+        return FillResult(None, False, "no_quote")
 
     def _simulate_exit(
         self,
@@ -291,25 +329,56 @@ class BacktestEngine:
         entry_bar: pd.Timestamp,
         lot_size: float,
         contract_multiplier: float,
-    ) -> tuple[pd.Timestamp | None, float | None, float | None, float | None, list | None]:
+    ) -> tuple[pd.Timestamp, float | None, float, float, list, str, str | None] | None:
         contract_rows = chain[chain["contract_name"] == candidate.body_contract].sort_values("bar_close")
         later = contract_rows[contract_rows["bar_close"] > entry_bar].head(self.config.max_holding_bars)
         if later.empty:
-            return None, None, None, None, None
-        candidate_exit_rows = []
-        for idx, row in enumerate(later.itertuples(index=False)):
-            should_exit = abs(getattr(row, "zscore", np.nan)) <= self.config.exit_z or abs(getattr(row, "zscore", np.nan)) >= self.config.stop_z
-            is_last = idx == len(later) - 1
-            if should_exit or is_last:
-                candidate_exit_rows.append((row.bar_close, row.zscore))
-        for exit_bar, exit_z in candidate_exit_rows:
-            leg_quotes = self._get_leg_open_quotes(chain_index, exit_bar, candidate)
-            if leg_quotes is None:
-                continue
-            exit_actions = self._build_actions(candidate, leg_quotes, is_exit=True)
-            fills = [fill_leg(row, action) for action, _, row in exit_actions]
-            if all(fill.filled for fill in fills):
-                exit_cashflow = self._cashflow_from_fills(exit_actions, fills, lot_size, contract_multiplier)
-                exit_turnover = self._turnover_from_fills(fills, lot_size, contract_multiplier)
-                return exit_bar, exit_z, exit_cashflow, exit_turnover, fills
-        return None, None, None, None, None
+            return None
+
+        # Phase 1: primary exit (trigger-based)
+        for row in later.itertuples(index=False):
+            z = getattr(row, "zscore", np.nan)
+            is_stop_loss = abs(z) >= self.config.stop_z
+            is_profit_take = abs(z) <= self.config.exit_z
+            if is_stop_loss or is_profit_take:
+                exit_type = "stop_loss" if is_stop_loss else "profit_take"
+                leg_quotes = self._get_leg_open_quotes(chain_index, row.bar_close, candidate)
+                if leg_quotes is None:
+                    continue
+                exit_actions = self._build_actions(candidate, leg_quotes, is_exit=True)
+                fills = [fill_leg(q, action) for action, _, q in exit_actions]
+                if all(fill.filled for fill in fills):
+                    cf = self._cashflow_from_fills(exit_actions, fills, lot_size, contract_multiplier)
+                    tv = self._turnover_from_fills(fills, lot_size, contract_multiplier)
+                    return row.bar_close, z, cf, tv, fills, exit_type, None
+
+        # Phase 2: time-stop fallback — walk back up to 3 bars from tail
+        tail_rows = list(later.itertuples(index=False))[-3:]
+        time_stop_bar = None
+        time_stop_quotes = None
+        time_stop_z: float | None = None
+        for ts_row in reversed(tail_rows):
+            quotes = self._get_leg_open_quotes(chain_index, ts_row.bar_close, candidate)
+            if quotes is not None:
+                time_stop_bar = ts_row.bar_close
+                time_stop_z = getattr(ts_row, "zscore", np.nan)
+                time_stop_quotes = quotes
+                break
+
+        if time_stop_quotes is not None:
+            exit_actions = self._build_actions(candidate, time_stop_quotes, is_exit=True)
+            fills = [self._fill_leg_with_fallback(q, action) for action, _, q in exit_actions]
+            fill_quality: str | None = None
+            for (_, _, q), fill in zip(exit_actions, fills):
+                age = q.get("trade_age_seconds")
+                if fill.reason == "lp_fallback" and pd.notna(age) and age > self.config.max_trade_age_seconds * 2:
+                    fill_quality = "degraded"
+                    break
+            cf = self._cashflow_from_fills(exit_actions, fills, lot_size, contract_multiplier)
+            tv = self._turnover_from_fills(fills, lot_size, contract_multiplier)
+            return time_stop_bar, time_stop_z, cf, tv, fills, "time_stop", fill_quality
+
+        # No walkback succeeded: time_stop_no_quote
+        last_row = list(later.itertuples(index=False))[-1]
+        no_fills = [FillResult(None, False, "no_quote")] * 4
+        return last_row.bar_close, getattr(last_row, "zscore", np.nan), 0.0, 0.0, no_fills, "time_stop_no_quote", "no_quote"

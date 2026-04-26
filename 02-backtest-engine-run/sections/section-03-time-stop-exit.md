@@ -257,3 +257,12 @@ for (action, contract_name), fill in zip(exit_leg_specs, exit_fill_results):
 | `tests/test_engine.py` | Append time-stop tests |
 
 `structures.py` is **not modified** here — section-01 handles that.
+
+## Implementation Status: COMPLETE
+
+**Tests:** 37/37 pass (16 new tests added for this section).
+
+**Deviations from plan:**
+- `time_stop_no_quote` path sets `fill_quality='no_quote'` (plan said `None`). Allows downstream filtering.
+- `_cashflow_from_fills` uses `fill.price if fill.price is not None else 0.0` not `fill.price or 0.0` (avoids treating zero premium as None).
+- 2 extra tests added beyond plan: phase-1 fallthrough (trigger fires but quotes missing) and SHORT_BFLY exit.

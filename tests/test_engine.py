@@ -1,9 +1,11 @@
 import types
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from essvi_bfly.backtest.engine import BacktestEngine
+from essvi_bfly.config import BacktestConfig
 from essvi_bfly.execution.fills import FillResult
 
 
@@ -165,3 +167,233 @@ def test_cashflow_scale_applied_contract_multiplier():
     ]
     result = _engine()._cashflow_from_fills(_LONG_BFLY_ENTRY, fills, lot_size=1.0, contract_multiplier=50.0)
     assert result == pytest.approx(3000.0)
+
+
+# ── Section 03 helpers ────────────────────────────────────────────────────────
+
+_ENTRY_BAR = pd.Timestamp("2024-01-01 10:00:00")
+
+
+def _engine_with_config(**kwargs):
+    engine = object.__new__(BacktestEngine)
+    engine.config = BacktestConfig(**kwargs)
+    return engine
+
+
+def _candidate3(direction="LONG_BFLY"):
+    return types.SimpleNamespace(
+        direction=direction,
+        wing_low_contract="LOW",
+        body_contract="BODY",
+        wing_high_contract="HIGH",
+        root_symbol="NIFTY",
+        expiry_code="26JAN",
+        option_side="CE",
+        zscore=2.0,
+    )
+
+
+def _make_chain(
+    body_bars: list[tuple],
+    skip_wings_at: set | None = None,
+    sp1: float | None = 100.0,
+    bp1: float | None = 98.0,
+    lp: float = 99.0,
+    trade_age_seconds: float = 60.0,
+):
+    """Create a minimal chain for _simulate_exit tests.
+
+    body_bars: [(bar_close, zscore), ...]
+    skip_wings_at: set of bar_close values where LOW and HIGH contracts are absent
+    """
+    skip = skip_wings_at or set()
+    rows = []
+    for bar, zscore in body_bars:
+        sp1_v = float("nan") if sp1 is None else sp1
+        bp1_v = float("nan") if bp1 is None else bp1
+        rows.append({
+            "contract_name": "BODY", "bar_close": bar, "zscore": zscore,
+            "sp1": sp1_v, "bp1": bp1_v, "bq1": 50.0, "sq1": 50.0,
+            "lp": lp, "trade_age_seconds": trade_age_seconds,
+        })
+        if bar not in skip:
+            for c in ["LOW", "HIGH"]:
+                rows.append({
+                    "contract_name": c, "bar_close": bar, "zscore": 0.0,
+                    "sp1": sp1_v, "bp1": bp1_v, "bq1": 50.0, "sq1": 50.0,
+                    "lp": lp, "trade_age_seconds": trade_age_seconds,
+                })
+    _cols = ["contract_name", "bar_close", "zscore", "sp1", "bp1", "bq1", "sq1", "lp", "trade_age_seconds"]
+    chain = pd.DataFrame(rows, columns=_cols) if rows else pd.DataFrame(columns=_cols)
+    chain_index = chain.set_index(["bar_close", "contract_name"])
+    return chain, chain_index
+
+
+def _bars(n: int, interval_secs: int = 300) -> list[pd.Timestamp]:
+    return [_ENTRY_BAR + pd.Timedelta(seconds=(i + 1) * interval_secs) for i in range(n)]
+
+
+# ── _fill_leg_with_fallback ───────────────────────────────────────────────────
+
+
+def test_fill_leg_with_fallback_buy_uses_sp1_when_valid():
+    row = pd.Series({"sp1": 105.0, "bp1": 103.0, "bq1": 50.0, "sq1": 50.0, "lp": 100.0})
+    result = _engine_with_config()._fill_leg_with_fallback(row, "BUY")
+    assert result.filled
+    assert result.price == pytest.approx(105.0)
+    assert result.reason == "ask_fill"
+
+
+def test_fill_leg_with_fallback_sell_uses_bp1_when_valid():
+    row = pd.Series({"sp1": 105.0, "bp1": 103.0, "bq1": 50.0, "sq1": 50.0, "lp": 100.0})
+    result = _engine_with_config()._fill_leg_with_fallback(row, "SELL")
+    assert result.filled
+    assert result.price == pytest.approx(103.0)
+    assert result.reason == "bid_fill"
+
+
+def test_fill_leg_with_fallback_buy_falls_back_to_lp_when_sp1_nan():
+    # half_spread = 0.12 / 4 = 0.03; lp=100 → 103.0
+    row = pd.Series({"sp1": float("nan"), "bp1": float("nan"), "lp": 100.0})
+    result = _engine_with_config()._fill_leg_with_fallback(row, "BUY")
+    assert result.filled
+    assert result.price == pytest.approx(103.0)
+    assert result.reason == "lp_fallback"
+
+
+def test_fill_leg_with_fallback_sell_falls_back_to_lp_when_bp1_nan():
+    # half_spread = 0.03; lp=100 → 97.0
+    row = pd.Series({"sp1": float("nan"), "bp1": float("nan"), "lp": 100.0})
+    result = _engine_with_config()._fill_leg_with_fallback(row, "SELL")
+    assert result.filled
+    assert result.price == pytest.approx(97.0)
+    assert result.reason == "lp_fallback"
+
+
+def test_fill_leg_with_fallback_returns_not_filled_when_both_nan():
+    row = pd.Series({"sp1": float("nan"), "bp1": float("nan"), "lp": float("nan")})
+    result = _engine_with_config()._fill_leg_with_fallback(row, "BUY")
+    assert not result.filled
+    assert result.price is None
+
+
+# ── _simulate_exit ────────────────────────────────────────────────────────────
+
+
+def test_simulate_exit_profit_take_exit_type():
+    bars = list(zip(_bars(3), [2.0, 0.3, 1.0]))  # bar2 z=0.3 <= exit_z=0.5
+    chain, chain_index = _make_chain(bars)
+    engine = _engine_with_config()
+    result = engine._simulate_exit(chain, chain_index, _candidate3(), _ENTRY_BAR, 1.0, 1.0)
+    assert result is not None
+    _, _, _, _, _, exit_type, _ = result
+    assert exit_type == "profit_take"
+
+
+def test_simulate_exit_stop_loss_exit_type():
+    bars = list(zip(_bars(3), [2.0, 4.0, 1.0]))  # bar2 z=4.0 >= stop_z=3.5
+    chain, chain_index = _make_chain(bars)
+    engine = _engine_with_config()
+    result = engine._simulate_exit(chain, chain_index, _candidate3(), _ENTRY_BAR, 1.0, 1.0)
+    assert result is not None
+    _, _, _, _, _, exit_type, _ = result
+    assert exit_type == "stop_loss"
+
+
+def test_simulate_exit_stop_loss_wins_over_profit_take_at_same_bar():
+    # exit_z=4.0, stop_z=0.1 → z=1.0 triggers both; stop_loss wins
+    bars = list(zip(_bars(1), [1.0]))
+    chain, chain_index = _make_chain(bars)
+    engine = _engine_with_config(exit_z=4.0, stop_z=0.1)
+    result = engine._simulate_exit(chain, chain_index, _candidate3(), _ENTRY_BAR, 1.0, 1.0)
+    assert result is not None
+    _, _, _, _, _, exit_type, _ = result
+    assert exit_type == "stop_loss"
+
+
+def test_simulate_exit_time_stop_when_no_trigger_fires():
+    # z=2.0 all bars: no trigger with default exit_z=0.5, stop_z=3.5
+    bars = list(zip(_bars(3), [2.0, 2.0, 2.0]))
+    chain, chain_index = _make_chain(bars)
+    engine = _engine_with_config(holding_bars_5m=3)
+    result = engine._simulate_exit(chain, chain_index, _candidate3(), _ENTRY_BAR, 1.0, 1.0)
+    assert result is not None
+    _, _, _, _, _, exit_type, _ = result
+    assert exit_type == "time_stop"
+
+
+def test_simulate_exit_returns_7_tuple_not_5():
+    bars = list(zip(_bars(1), [0.3]))  # profit_take
+    chain, chain_index = _make_chain(bars)
+    engine = _engine_with_config()
+    result = engine._simulate_exit(chain, chain_index, _candidate3(), _ENTRY_BAR, 1.0, 1.0)
+    assert result is not None
+    bar, z, cf, tv, fills, exit_type, fill_quality = result  # must not raise ValueError
+    assert len(fills) == 4
+
+
+def test_simulate_exit_returns_none_when_body_has_no_bars_after_entry():
+    chain, chain_index = _make_chain([])  # no bars at all
+    engine = _engine_with_config()
+    result = engine._simulate_exit(chain, chain_index, _candidate3(), _ENTRY_BAR, 1.0, 1.0)
+    assert result is None
+
+
+def test_simulate_exit_staleness_guard_sets_degraded_fill_quality():
+    # No triggers (z=2.0), sp1/bp1=NaN → lp_fallback, trade_age=900 > 300*2=600 → degraded
+    bars = list(zip(_bars(2), [2.0, 2.0]))
+    chain, chain_index = _make_chain(bars, sp1=None, bp1=None, lp=100.0, trade_age_seconds=900.0)
+    engine = _engine_with_config(holding_bars_5m=2, max_trade_age_seconds=300)
+    result = engine._simulate_exit(chain, chain_index, _candidate3(), _ENTRY_BAR, 1.0, 1.0)
+    assert result is not None
+    _, _, _, _, _, exit_type, fill_quality = result
+    assert exit_type == "time_stop"
+    assert fill_quality == "degraded"
+
+
+def test_simulate_exit_time_stop_walks_back_when_wing_missing_at_last_bar():
+    ts = _bars(3)
+    bars = list(zip(ts, [2.0, 2.0, 2.0]))
+    # Last bar (ts[2]) is missing LOW and HIGH
+    chain, chain_index = _make_chain(bars, skip_wings_at={ts[2]})
+    engine = _engine_with_config(holding_bars_5m=3)
+    result = engine._simulate_exit(chain, chain_index, _candidate3(), _ENTRY_BAR, 1.0, 1.0)
+    assert result is not None
+    exit_bar, _, _, _, _, exit_type, _ = result
+    assert exit_type == "time_stop"
+    assert exit_bar == ts[1]  # walked back to bar-1
+
+
+def test_simulate_exit_time_stop_no_quote_when_no_walkback_succeeds():
+    ts = _bars(3)
+    bars = list(zip(ts, [2.0, 2.0, 2.0]))
+    # All 3 bars missing wings
+    chain, chain_index = _make_chain(bars, skip_wings_at=set(ts))
+    engine = _engine_with_config(holding_bars_5m=3)
+    result = engine._simulate_exit(chain, chain_index, _candidate3(), _ENTRY_BAR, 1.0, 1.0)
+    assert result is not None
+    _, _, _, _, _, exit_type, fill_quality = result
+    assert exit_type == "time_stop_no_quote"
+    assert fill_quality == "no_quote"
+
+
+def test_simulate_exit_phase1_fallthrough_when_trigger_bar_missing_quotes():
+    # stop_loss trigger fires at bar1 but wings are missing there → falls through to Phase 2
+    ts = _bars(3)
+    bars = list(zip(ts, [4.0, 2.0, 2.0]))  # bar1 z=4.0 → stop_loss trigger
+    chain, chain_index = _make_chain(bars, skip_wings_at={ts[0]})  # wings missing at bar1
+    engine = _engine_with_config(holding_bars_5m=3)
+    result = engine._simulate_exit(chain, chain_index, _candidate3(), _ENTRY_BAR, 1.0, 1.0)
+    assert result is not None
+    _, _, _, _, _, exit_type, _ = result
+    assert exit_type == "time_stop"  # fell through to Phase 2
+
+
+def test_simulate_exit_short_bfly_profit_take():
+    bars = list(zip(_bars(2), [2.0, 0.3]))  # bar2 z=0.3 → profit_take
+    chain, chain_index = _make_chain(bars)
+    engine = _engine_with_config()
+    result = engine._simulate_exit(chain, chain_index, _candidate3("SHORT_BFLY"), _ENTRY_BAR, 1.0, 1.0)
+    assert result is not None
+    _, _, _, _, _, exit_type, _ = result
+    assert exit_type == "profit_take"
