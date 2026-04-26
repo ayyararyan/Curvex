@@ -32,3 +32,7 @@ class ButterflyTrade:
     lot_size: float = 1.0
     contract_multiplier: float = 1.0
     status: str = "OPEN"
+    # Allowed values: 'profit_take' | 'stop_loss' | 'time_stop' | 'time_stop_no_quote'
+    exit_type: str | None = None
+    # Allowed values: None (normal) | 'degraded' (stale lp used at time-stop)
+    exit_fill_quality: str | None = None

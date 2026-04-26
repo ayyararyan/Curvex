@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict
 
 import numpy as np
@@ -14,6 +15,8 @@ from essvi_bfly.preprocess.option_chain import build_session_chain
 from essvi_bfly.signal.candidate_selection import select_candidates
 from essvi_bfly.signal.residuals import calibrate_surface
 from essvi_bfly.signal.zscores import add_residual_zscores
+
+logger = logging.getLogger(__name__)
 
 
 class BacktestEngine:
@@ -83,7 +86,7 @@ class BacktestEngine:
     def _simulate(self, chain: pd.DataFrame, candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         if candidates.empty:
             return (
-                pd.DataFrame(columns=["trade_id", "root_symbol", "expiry_code", "direction", "entry_bar", "body_contract", "wing_low_contract", "wing_high_contract", "option_side", "entry_zscore", "entry_cost", "lot_size", "contract_multiplier", "status"]),
+                pd.DataFrame(columns=["trade_id", "root_symbol", "expiry_code", "direction", "entry_bar", "body_contract", "wing_low_contract", "wing_high_contract", "option_side", "entry_zscore", "entry_cost", "exit_bar", "exit_zscore", "lot_size", "contract_multiplier", "status", "exit_type", "exit_fill_quality"]),
                 pd.DataFrame(columns=["trade_id", "bar_close", "contract_name", "action", "fill_price", "reason"]),
                 pd.DataFrame(columns=["trade_id", "entry_bar", "exit_bar", "entry_zscore", "exit_zscore", "theoretical_edge", "transaction_cost", "pnl"]),
             )

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import sys
 
 from essvi_bfly.backtest.event_loop import run_backtest
 from essvi_bfly.config import BacktestConfig
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
     parser = argparse.ArgumentParser(description="Run eSSVI butterfly backtest.")
     parser.add_argument("--strategy", default="butterfly", choices=["butterfly", "straddle"])
     parser.add_argument("--root-symbol", action="append", dest="root_symbols", default=None)

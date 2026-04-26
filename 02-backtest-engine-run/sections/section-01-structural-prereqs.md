@@ -99,8 +99,13 @@ If `scripts/run_backtest.py` has its own `main()` guard that bypasses `__main__.
 
 ## Acceptance Checklist
 
-- [ ] `ButterflyTrade` has `exit_type: str | None = None` and `exit_fill_quality: str | None = None` as the last two fields
-- [ ] `engine.py` has `import logging` and `logger = logging.getLogger(__name__)` at module level
-- [ ] `__main__.py` has `logging.basicConfig(level=logging.INFO, stream=sys.stderr, ...)` at the start of `main()`
-- [ ] `uv run pytest tests/ -v` passes (no import errors, no broken dataclass construction in existing tests)
-- [ ] `python -c "from essvi_bfly.portfolio.structures import ButterflyTrade"` exits without error
+- [x] `ButterflyTrade` has `exit_type: str | None = None` and `exit_fill_quality: str | None = None` as the last two fields
+- [x] `engine.py` has `import logging` and `logger = logging.getLogger(__name__)` at module level
+- [x] `__main__.py` has `logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True, ...)` at the start of `main()`
+- [x] `uv run pytest tests/ -v` passes — 8/8 tests pass
+- [x] `python -c "from essvi_bfly.portfolio.structures import ButterflyTrade"` exits without error
+
+## Deviations from Plan
+
+- `logging.basicConfig` call has `force=True` added (review finding: call is a no-op without it if a root handler is already installed).
+- Empty-trades fallback column list in `_simulate` updated to include all 18 `ButterflyTrade` fields (`exit_bar`, `exit_zscore`, `exit_type`, `exit_fill_quality` were missing — pre-existing bug compounded by new fields).
