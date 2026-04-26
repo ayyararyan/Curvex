@@ -1,4 +1,6 @@
+import logging
 import types
+import unittest.mock
 
 import numpy as np
 import pandas as pd
@@ -7,6 +9,7 @@ import pytest
 from essvi_bfly.backtest.engine import BacktestEngine
 from essvi_bfly.config import BacktestConfig
 from essvi_bfly.execution.fills import FillResult
+from essvi_bfly.preprocess.option_chain import SessionChainArtifacts
 
 
 def _engine():
@@ -397,3 +400,151 @@ def test_simulate_exit_short_bfly_profit_take():
     assert result is not None
     _, _, _, _, _, exit_type, _ = result
     assert exit_type == "profit_take"
+
+
+# ── Section 04 helpers ────────────────────────────────────────────────────────
+
+
+def _engine_for_run(sessions=("2024-01-01",), root_symbols=("NIFTY",)):
+    engine = object.__new__(BacktestEngine)
+    engine.config = BacktestConfig(root_symbols=root_symbols)
+    engine.manifest = pd.DataFrame({"session_date": list(sessions)})
+    return engine
+
+
+def _fake_artifact(n_rows: int = 3):
+    chain = pd.DataFrame({
+        "contract_name": [f"C{i}" for i in range(n_rows)],
+        "bar_close": [pd.Timestamp("2024-01-01 10:00")] * n_rows,
+    })
+    return SessionChainArtifacts(option_bars=chain.copy(), underlying_bars=pd.DataFrame())
+
+
+def _run_mocked(engine, bsc_effects, chain_rows=3):
+    """Run engine.run() with all external deps mocked.
+
+    bsc_effects: list; each element is either an Exception instance (to raise)
+                 or None (to return _fake_artifact(chain_rows)).
+    Returns (reports, exception) — one will be None.
+    """
+    effects = list(bsc_effects)
+    chain = pd.DataFrame({
+        "contract_name": [f"C{i}" for i in range(chain_rows)],
+        "bar_close": [pd.Timestamp("2024-01-01 10:00")] * chain_rows,
+    })
+
+    def bsc_side(*args, **kwargs):
+        e = effects.pop(0)
+        if isinstance(e, Exception):
+            raise e
+        return _fake_artifact(chain_rows)
+
+    _empty_trades = pd.DataFrame(columns=["trade_id"])
+    engine._simulate = lambda *a, **kw: (_empty_trades, pd.DataFrame(), pd.DataFrame())
+
+    with unittest.mock.patch("essvi_bfly.backtest.engine.build_session_chain", side_effect=bsc_side), \
+         unittest.mock.patch("essvi_bfly.backtest.engine.calibrate_surface",
+                             return_value=(chain.copy(), pd.DataFrame())), \
+         unittest.mock.patch("essvi_bfly.backtest.engine.add_residual_zscores",
+                             side_effect=lambda df, cfg: df), \
+         unittest.mock.patch("essvi_bfly.backtest.engine.select_candidates",
+                             return_value=pd.DataFrame()):
+        try:
+            return engine.run(), None
+        except Exception as exc:
+            return None, exc
+
+
+# ── _build_nav ────────────────────────────────────────────────────────────────
+
+
+def test_build_nav_cumulative_pnl():
+    rows = [
+        {"trade_id": 1, "pnl": 10.0},
+        {"trade_id": 2, "pnl": -5.0},
+        {"trade_id": 3, "pnl": 20.0},
+    ]
+    df = _engine_with_config()._build_nav(rows)
+    assert list(df["cumulative_pnl"]) == pytest.approx([10.0, 5.0, 25.0])
+
+
+def test_build_nav_preserves_trade_id():
+    rows = [{"trade_id": 7, "pnl": 100.0}, {"trade_id": 3, "pnl": 50.0}]
+    df = _engine_with_config()._build_nav(rows)
+    assert list(df["trade_id"]) == [3, 7]  # sorted ascending
+
+
+def test_build_nav_integration_csv_has_cumulative_pnl(tmp_path):
+    rows = [{"trade_id": 1, "pnl": 5.0}]
+    df = _engine_with_config()._build_nav(rows)
+    csv_path = tmp_path / "butterfly_nav.csv"
+    df.to_csv(csv_path, index=False)
+    reloaded = pd.read_csv(csv_path)
+    assert "cumulative_pnl" in reloaded.columns
+
+
+def test_build_nav_empty_list_returns_correct_columns():
+    df = _engine_with_config()._build_nav([])
+    expected = {
+        "trade_id", "entry_bar", "exit_bar", "entry_zscore", "exit_zscore",
+        "theoretical_edge", "entry_cashflow", "exit_cashflow", "transaction_cost",
+        "pnl", "cumulative_pnl",
+    }
+    assert set(df.columns) == expected
+    assert len(df) == 0
+
+
+# ── run() session resilience ──────────────────────────────────────────────────
+
+
+def test_run_skips_session_on_file_not_found(caplog):
+    engine = _engine_for_run(sessions=("2024-01-01", "2024-01-02"))
+    with caplog.at_level(logging.WARNING, logger="essvi_bfly.backtest.engine"):
+        reports, exc = _run_mocked(engine, [FileNotFoundError("missing"), None])
+    assert exc is None
+    assert any("Skipping" in r.message for r in caplog.records if r.levelno == logging.WARNING)
+
+
+def test_run_skips_session_on_oserror(caplog):
+    engine = _engine_for_run(sessions=("2024-01-01", "2024-01-02"))
+    with caplog.at_level(logging.WARNING, logger="essvi_bfly.backtest.engine"):
+        reports, exc = _run_mocked(engine, [OSError("io failure"), None])
+    assert exc is None
+    assert any("Skipping" in r.message for r in caplog.records if r.levelno == logging.WARNING)
+
+
+def test_run_does_not_catch_keyerror_from_simulate():
+    engine = _engine_for_run(sessions=("2024-01-01",))
+    chain = pd.DataFrame({"contract_name": ["C1"], "bar_close": [pd.Timestamp("2024-01-01 10:00")]})
+    engine._simulate = unittest.mock.Mock(side_effect=KeyError("unexpected"))
+    with unittest.mock.patch("essvi_bfly.backtest.engine.build_session_chain",
+                             return_value=_fake_artifact()), \
+         unittest.mock.patch("essvi_bfly.backtest.engine.calibrate_surface",
+                             return_value=(chain, pd.DataFrame())), \
+         unittest.mock.patch("essvi_bfly.backtest.engine.add_residual_zscores",
+                             side_effect=lambda df, cfg: df), \
+         unittest.mock.patch("essvi_bfly.backtest.engine.select_candidates",
+                             return_value=pd.DataFrame(columns=["body_contract"])):
+        with pytest.raises(KeyError):
+            engine.run()
+
+
+def test_run_raises_runtime_error_on_zero_rows_all_symbols():
+    engine = _engine_for_run(sessions=("2024-01-01",), root_symbols=("NIFTY",))
+    _, exc = _run_mocked(engine, [FileNotFoundError("no data")])
+    assert isinstance(exc, RuntimeError)
+
+
+def test_run_raises_runtime_error_on_zero_rows_for_symbol():
+    # NIFTY works; BANKNIFTY fails → RuntimeError mentioning BANKNIFTY
+    engine = _engine_for_run(sessions=("2024-01-01",), root_symbols=("NIFTY", "BANKNIFTY"))
+    _, exc = _run_mocked(engine, [None, FileNotFoundError("no data")])
+    assert isinstance(exc, RuntimeError)
+    assert "BANKNIFTY" in str(exc)
+
+
+def test_run_continues_after_data_error():
+    engine = _engine_for_run(sessions=("2024-01-01", "2024-01-02"))
+    reports, exc = _run_mocked(engine, [FileNotFoundError("fail"), None])
+    assert exc is None
+    assert reports is not None

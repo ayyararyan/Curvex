@@ -130,9 +130,20 @@ Also add a combined check: if `sum(rows_produced_for_symbol.values()) == 0`, rai
 
 ## Acceptance Criteria
 
-- [ ] `_build_nav` produces `cumulative_pnl = pnl.cumsum()` sorted by `trade_id` — `test_build_nav_cumulative_pnl` passes
-- [ ] `butterfly_nav.csv` written to disk contains `cumulative_pnl` column
-- [ ] `run()` skips sessions on FileNotFoundError and OSError and logs warnings — tests pass
-- [ ] `run()` does **not** catch `KeyError` from `_simulate` — test passes
-- [ ] `run()` raises `RuntimeError` on zero rows per symbol — test passes
-- [ ] `uv run pytest tests/ -v` exits 0
+- [x] `_build_nav` produces `cumulative_pnl = pnl.cumsum()` sorted by `trade_id` — `test_build_nav_cumulative_pnl` passes
+- [x] `butterfly_nav.csv` written to disk contains `cumulative_pnl` column
+- [x] `run()` skips sessions on FileNotFoundError and OSError and logs warnings — tests pass
+- [x] `run()` does **not** catch `KeyError` from `_simulate` — test passes
+- [x] `run()` raises `RuntimeError` on zero rows per symbol — test passes
+- [x] `uv run pytest tests/ -v` exits 0
+
+## Implementation Status: COMPLETE
+
+**Tests:** 47/47 pass (10 new tests: 4 nav + 6 resilience).
+
+**Deviations from plan:**
+
+- Plan specified `from pyarrow.lib import ArrowInvalidError, ArrowIOError` — `ArrowInvalidError` does not exist in pyarrow's public API. Used `import pyarrow` and `pyarrow.ArrowInvalid` (correct class name). Added inline comment documenting the typo.
+- Plan included both a global `sum(rows_produced.values()) == 0` check AND a per-symbol loop. The global check was dead code for single-symbol configs (per-symbol loop fires first with more informative message). Global check removed; per-symbol loop handles all cases.
+- `_build_nav([])` empty guard expanded from 3-column stub to full 11-column schema (`["trade_id", "entry_bar", "exit_bar", "entry_zscore", "exit_zscore", "theoretical_edge", "entry_cashflow", "exit_cashflow", "transaction_cost", "pnl", "cumulative_pnl"]`) to match non-empty output schema.
+- 1 extra test added beyond plan: `test_build_nav_empty_list_returns_correct_columns`.

@@ -5,6 +5,7 @@ from dataclasses import asdict
 
 import numpy as np
 import pandas as pd
+import pyarrow
 
 from essvi_bfly.config import BacktestConfig
 from essvi_bfly.execution.fills import FillResult, fill_leg
@@ -42,13 +43,30 @@ class BacktestEngine:
     def run(self) -> dict[str, pd.DataFrame]:
         session_chains: list[pd.DataFrame] = []
         diagnostics_frames: list[pd.DataFrame] = []
+        rows_produced: dict[str, int] = {s: 0 for s in self.config.root_symbols}
         for root_symbol in self.config.root_symbols:
             for session_date in self.available_sessions():
-                artifacts = build_session_chain(self.manifest, session_date, root_symbol, self.config)
+                try:
+                    artifacts = build_session_chain(self.manifest, session_date, root_symbol, self.config)
+                except (FileNotFoundError, pyarrow.ArrowInvalid, pyarrow.ArrowIOError, OSError,  # plan had ArrowInvalidError (typo); correct class is ArrowInvalid
+                        pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+                    logger.warning("Skipping %s %s — data load failed: %s", root_symbol, session_date, e)
+                    continue
+                if artifacts.option_bars.empty:
+                    logger.warning("Skipping %s %s — empty option chain", root_symbol, session_date)
+                    continue
                 chain, diagnostics = calibrate_surface(artifacts.option_bars, self.config)
                 chain = add_residual_zscores(chain, self.config)
                 session_chains.append(chain)
                 diagnostics_frames.append(diagnostics)
+                rows_produced[root_symbol] += len(chain)
+        for symbol in self.config.root_symbols:
+            if rows_produced[symbol] == 0:
+                raise RuntimeError(
+                    f"Zero chain rows produced for symbol {symbol!r}. "
+                    "All sessions were skipped, returned empty data, or calibration produced no rows. "
+                    "Check session skip warnings above."
+                )
         all_chain = pd.concat(session_chains, ignore_index=True) if session_chains else pd.DataFrame()
         all_diagnostics = pd.concat(diagnostics_frames, ignore_index=True) if diagnostics_frames else pd.DataFrame()
         candidates = select_candidates(all_chain, all_diagnostics, self.config)
@@ -222,7 +240,19 @@ class BacktestEngine:
                 }
             )
             trade_id += 1
-        return pd.DataFrame([asdict(t) for t in trades]), pd.DataFrame(fills_rows), pd.DataFrame(nav_rows)
+        return pd.DataFrame([asdict(t) for t in trades]), pd.DataFrame(fills_rows), self._build_nav(nav_rows)
+
+    def _build_nav(self, nav_rows: list[dict]) -> pd.DataFrame:
+        if not nav_rows:
+            return pd.DataFrame(columns=[
+                "trade_id", "entry_bar", "exit_bar", "entry_zscore", "exit_zscore",
+                "theoretical_edge", "entry_cashflow", "exit_cashflow", "transaction_cost",
+                "pnl", "cumulative_pnl",
+            ])
+        df = pd.DataFrame(nav_rows)
+        df = df.sort_values("trade_id").reset_index(drop=True)
+        df["cumulative_pnl"] = df["pnl"].cumsum()
+        return df
 
     def _next_bar_for_contract(self, chain: pd.DataFrame, contract_name: str, after_bar: pd.Timestamp) -> pd.Timestamp | None:
         contract_rows = chain[chain["contract_name"] == contract_name].sort_values("bar_close")
