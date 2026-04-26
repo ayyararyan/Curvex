@@ -104,9 +104,9 @@ class BacktestEngine:
     def _simulate(self, chain: pd.DataFrame, candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         if candidates.empty:
             return (
-                pd.DataFrame(columns=["trade_id", "root_symbol", "expiry_code", "direction", "entry_bar", "body_contract", "wing_low_contract", "wing_high_contract", "option_side", "entry_zscore", "entry_cost", "exit_bar", "exit_zscore", "lot_size", "contract_multiplier", "status", "exit_type", "exit_fill_quality"]),
-                pd.DataFrame(columns=["trade_id", "bar_close", "contract_name", "action", "fill_price", "reason"]),
-                pd.DataFrame(columns=["trade_id", "entry_bar", "exit_bar", "entry_zscore", "exit_zscore", "theoretical_edge", "transaction_cost", "pnl"]),
+                pd.DataFrame(columns=["trade_id", "root_symbol", "expiry_code", "direction", "entry_bar", "body_contract", "wing_low_contract", "wing_high_contract", "option_side", "entry_zscore", "entry_cost", "exit_bar", "exit_zscore", "lot_size", "contract_multiplier", "status", "exit_type", "exit_fill_quality", "pnl"]),
+                pd.DataFrame(columns=["trade_id", "leg_index", "bar_close", "contract_name", "action", "fill_price", "fill_reason"]),
+                pd.DataFrame(columns=["trade_id", "entry_bar", "exit_bar", "entry_zscore", "exit_zscore", "theoretical_edge", "entry_cashflow", "exit_cashflow", "transaction_cost", "pnl", "cumulative_pnl"]),
             )
         chain_index = chain.set_index(["bar_close", "contract_name"])
         bar_index = self._build_contract_bar_index(chain)
@@ -167,6 +167,7 @@ class BacktestEngine:
                 1,
             )
             transaction_cost = entry_cost + exit_cost
+            pnl = entry_cashflow + exit_cashflow - transaction_cost
             trade = ButterflyTrade(
                 trade_id=trade_id,
                 root_symbol=candidate.root_symbol,
@@ -186,18 +187,20 @@ class BacktestEngine:
                 status="CLOSED",
                 exit_type=exit_type,
                 exit_fill_quality=fill_quality,
+                pnl=pnl,
             )
             active_until[structure_key] = pd.Timestamp(exit_bar)
             trades.append(trade)
-            for (action, contract_name, _), fill in zip(entry_actions, fill_results):
+            for leg_index, ((action, contract_name, _), fill) in enumerate(zip(entry_actions, fill_results)):
                 fills_rows.append(
                     {
                         "trade_id": trade_id,
+                        "leg_index": leg_index,
                         "bar_close": entry_bar,
                         "contract_name": contract_name,
                         "action": action,
                         "fill_price": fill.price,
-                        "reason": f"entry_{fill.reason}",
+                        "fill_reason": f"entry_{fill.reason}",
                     }
                 )
             if candidate.direction == "LONG_BFLY":
@@ -214,18 +217,18 @@ class BacktestEngine:
                     ("SELL", candidate.body_contract),
                     ("BUY", candidate.wing_high_contract),
                 ]
-            for (action, contract_name), fill in zip(exit_leg_specs, exit_fill_results):
+            for leg_index, ((action, contract_name), fill) in enumerate(zip(exit_leg_specs, exit_fill_results)):
                 fills_rows.append(
                     {
                         "trade_id": trade_id,
+                        "leg_index": leg_index,
                         "bar_close": exit_bar,
                         "contract_name": contract_name,
                         "action": action,
                         "fill_price": fill.price,
-                        "reason": f"exit_{fill.reason}",
+                        "fill_reason": f"exit_{fill.reason}",
                     }
                 )
-            pnl = entry_cashflow + exit_cashflow - transaction_cost
             nav_rows.append(
                 {
                     "trade_id": trade_id,

@@ -36,3 +36,4 @@ class ButterflyTrade:
     exit_type: str | None = None
     # Allowed values: None (normal) | 'degraded' (stale lp used at time-stop)
     exit_fill_quality: str | None = None
+    pnl: float | None = None

@@ -53,10 +53,11 @@ def main() -> None:
     # 3. ATM mid prices
     if "forward" in chain.columns and "strike" in chain.columns and "mid" in chain.columns:
         valid_fwd = chain["forward"].notna() & (chain["forward"] > 0) & chain["strike"].notna()
-        atm_mask = valid_fwd & (np.log(chain["strike"].where(valid_fwd, 1) / chain["forward"].where(valid_fwd, 1)).abs() <= 0.03)
+        quote_ok_col = chain["quote_ok"].fillna(False) if "quote_ok" in chain.columns else pd.Series(True, index=chain.index)
+        atm_mask = valid_fwd & quote_ok_col & (np.log(chain["strike"].where(valid_fwd, 1) / chain["forward"].where(valid_fwd, 1)).abs() <= 0.03)
         atm_rows = chain[atm_mask]
         if len(atm_rows) == 0:
-            results.append(check("ATM mid prices > 0", False, "no ATM rows found"))
+            results.append(check("ATM mid prices > 0", False, "no quoted ATM rows found"))
         else:
             atm_fail = int((atm_rows["mid"].fillna(0) <= 0).sum())
             results.append(check("ATM mid prices > 0", atm_fail == 0, f"atm_rows={len(atm_rows)}, fail={atm_fail}"))
@@ -149,17 +150,22 @@ def main() -> None:
     results.append(check("Underlying contract resolved", underlying_ok, f"contract={underlying_contract}"))
 
     # 11. Session-boundary z-score NaN guard
+    # z-scores are computed within (contract, session_date) with min_periods=min(20,window),
+    # so the first min_periods-1 bars per (contract, session) must always be NaN.
     window = config.zscore_window
-    if "zscore" in chain.columns and "contract_name" in chain.columns and "bar_close" in chain.columns:
+    min_periods = min(20, window)
+    guard_bars = min_periods - 1
+    if "zscore" in chain.columns and "contract_name" in chain.columns and "bar_close" in chain.columns and "session_date" in chain.columns:
+        group_keys = ["contract_name", "session_date"]
         first_n = (
-            chain.sort_values(["contract_name", "bar_close"])
-                 .groupby("contract_name")
-                 .head(window)
+            chain.sort_values(group_keys + ["bar_close"])
+                 .groupby(group_keys)
+                 .head(guard_bars)
         )
         non_nan = int(first_n["zscore"].notna().sum())
-        results.append(check(f"Z-score NaN in first {window} bars per contract", non_nan == 0, f"non_nan={non_nan}"))
+        results.append(check(f"Z-score NaN in first {guard_bars} bars per contract-session", non_nan == 0, f"non_nan={non_nan}"))
     else:
-        results.append(check(f"Z-score NaN in first {window} bars per contract", False, "zscore column missing"))
+        results.append(check(f"Z-score NaN in first {guard_bars} bars per contract-session", False, "required columns missing"))
 
     sys.exit(0 if all(results) else 1)
 

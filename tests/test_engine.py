@@ -672,6 +672,7 @@ def _make_smoke_valid_chain() -> pd.DataFrame:
             rows.append({
                 "contract_name": contract,
                 "bar_close": bar,
+                "session_date": "2026_01_02",
                 "strike": strike,
                 "tau_years": 0.1,
                 "forward": 100.0,
