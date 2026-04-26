@@ -123,11 +123,18 @@ Import `FillResult` from `essvi_bfly.execution.fills`. Create synthetic fill obj
 
 ## Acceptance Checklist
 
-- [ ] `_build_actions` audit complete — "confirmed-correct" or list of cells fixed — recorded in commit message
-- [ ] `orders=1` confirmed correct at both `estimate_transaction_cost` call sites (no change needed)
-- [ ] All 4 `test_build_actions_*` tests pass
-- [ ] `test_cashflow_long_bfly_entry_hand_computed` asserts exactly +60.0
-- [ ] `uv run pytest tests/ -v` exits 0
+- [x] `_build_actions` audit complete — confirmed-correct (no changes needed)
+- [x] `orders=1` confirmed correct at both `estimate_transaction_cost` call sites (NSE combined basket order)
+- [x] All 4 `test_build_actions_*` tests pass
+- [x] `test_cashflow_long_bfly_entry_hand_computed` asserts exactly +60.0
+- [x] `uv run pytest tests/ -v` exits 0 — 21 tests pass
+
+## Deviations from Plan
+
+- Added 2 scale tests (`test_cashflow_scale_applied_lot_size` + `test_cashflow_scale_applied_contract_multiplier`) instead of 1 to discriminate between `lot_size` and `contract_multiplier` in `scale = lot_size * contract_multiplier`.
+- Cashflow tests use inline action lists (not `_build_actions`) to isolate `_cashflow_from_fills`.
+- Contract-name test uses asymmetric names (`WING_A`/`CENTER`/`WING_Z`) to detect LOW/HIGH swap bugs.
+- Deleted `test_pnl_positive_for_profitable_reversal` (pure arithmetic, called no engine methods).
 
 ---
 
